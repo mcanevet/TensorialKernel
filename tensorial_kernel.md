@@ -11,14 +11,15 @@
 1. [The Problem Being Solved](#1-the-problem-being-solved)
 2. [The Architecture](#2-the-architecture)
 3. [Core Mechanisms](#3-core-mechanisms)
-4. [Adversarial Analysis — The Six Redlines](#4-adversarial-analysis--the-six-redlines)
-5. [Current State of Research](#5-current-state-of-research)
-6. [Novelty Assessment](#6-novelty-assessment)
-7. [Practical Applications](#7-practical-applications)
-8. [Honest Evaluation — Pros and Cons](#8-honest-evaluation--pros-and-cons)
-9. [Hardware Prerequisites and Timeline](#9-hardware-prerequisites-and-timeline)
-10. [Recommended Next Steps](#10-recommended-next-steps)
-11. [References and Related Work](#11-references-and-related-work)
+4. [Contract Language — Formal Stress Test](#4-contract-language--formal-stress-test)
+5. [Adversarial Analysis — The Six Redlines](#5-adversarial-analysis--the-six-redlines)
+6. [Current State of Research](#6-current-state-of-research)
+7. [Novelty Assessment](#7-novelty-assessment)
+8. [Practical Applications](#8-practical-applications)
+9. [Honest Evaluation — Pros and Cons](#9-honest-evaluation--pros-and-cons)
+10. [Hardware Prerequisites and Timeline](#10-hardware-prerequisites-and-timeline)
+11. [Recommended Next Steps](#11-recommended-next-steps)
+12. [References and Related Work](#12-references-and-related-work)
 
 ---
 
@@ -141,10 +142,26 @@ multiple hardware perspectives simultaneously, with the kernel's job being to
 keep those views consistent rather than to control who can access what.
 
 **Rust's ownership model does real work here:** A projection is an owned Rust
-value. You cannot have two conflicting exclusive projections simultaneously —
-the borrow checker enforces this at compile time. `Send` and `Sync` become
-coherency markers: a type that is `!Send` cannot be projected across a compute
-element boundary without an explicit coherency contract.
+value. `Send` and `Sync` become coherency markers: a type that is `!Send`
+cannot be projected across a compute element boundary without an explicit
+coherency contract. This is the strongest genuinely novel contribution of the
+contract language — applying Rust's existing ownership system as a *coherency
+enforcement mechanism*, not merely a memory safety mechanism. The closest
+formal analogue is **fractional permissions** (Boyland 2003): a resource can
+be split into read-capable fractions and a single write-capable whole, mapping
+directly onto `coherent` (multiple readers with ordering) vs. `exclusive`
+(single writer). This connection provides a path to a well-founded formal
+semantics.
+
+**Critical caveat — physical aliasing:** The borrow checker enforces that two
+Rust objects cannot alias. But two independently constructed `CapabilityTensor`
+objects over *overlapping physical address ranges* are different Rust objects —
+the compiler cannot detect the physical overlap. If two components independently
+construct tensors over the same MMIO region and both declare `exclusive`
+projections, both contracts are accepted but neither is actually exclusive. The
+kernel must perform physical address overlap detection at contract submission
+time, which is not a Rust-level guarantee. This is an open implementation
+requirement, not a solved problem.
 
 ### 3.2 Consistency Contracts
 
@@ -169,17 +186,66 @@ contract, configures the hardware (IOMMU, CXL fabric, cache coherency
 controllers), and steps aside. The contract is the kernel interface — there
 are no system calls in the traditional sense.
 
+**Formal semantics (draft — requires rigorous treatment):**
+
+For `coherent(A, B) within T`: for any write `w` to the physical resource via
+projection `A` at logical time `t`, the written value must be observable via
+projection `B` by time `t + T`. In distributed systems terms this is closest
+to **δ-consistency** (Yu & Vahdat 2000) — bounded-time visibility — which is
+strictly between linearizability and eventual consistency.
+
+For `exclusive(X)`: at most one write-capable projection of the physical region
+exists at any time. Closest formal analogue: the write-capable whole in
+fractional permissions (Boyland 2003).
+
+For `relaxed(A, B)`: no ordering or visibility guarantee. Semantically
+equivalent to eventual consistency with unbounded convergence time. The
+reconciliation mechanism must be defined by the application — the contract
+language provides no reconciliation primitives.
+
+**Known semantic gaps (open problems):**
+
+- **`within T` presupposes a global clock**, which does not exist in a
+  distributed hardware system. CXL defines ordering but not a shared time
+  reference. Clock skew between devices is on the order of 1–10ns and varies
+  with thermal state. For tight bounds (`within 10ns`), the guarantee is
+  physically ambiguous. The contract language must be grounded in
+  hardware-observable happens-before ordering events, not wall-clock time.
+- **Coherency transitivity is undefined.** If `coherent(A, B) within 50ns`
+  and `coherent(B, C) within 50ns`, is `coherent(A, C) within 100ns` implied?
+  If transitive, pairwise constraints grow O(n²) for n projections.
+  If not transitive, applications will silently assume transitivity and have
+  correctness bugs.
+- **`exclusive` granularity is unspecified.** Byte, cache line, page, or
+  entire region? Exclusive at one granularity does not imply exclusive at
+  another.
+- **`relaxed` convergence is unspecified.** "No guarantee" could mean writes
+  never propagate (useless) or propagate eventually (eventual consistency).
+  These are not equivalent.
+
 **Contract classes (for tractability):**
 
 | Class | Topology | Solve complexity | Who can use |
 |---|---|---|---|
 | A | Single resource, one user | O(1) | All |
 | B | Linear chain | O(n) | All |
-| C | Acyclic dependency graph (DAG) | O(n²) | All |
+| C | Acyclic dependency graph (DAG) | O(n²) claimed* | All |
 | D | Arbitrary graph | NP-complete | Privileged only |
 
-Restricting unprivileged applications to Class A–C prevents denial-of-service
-via constraint complexity.
+*The O(n²) claim for Class C requires proof for the hardware mapping problem
+specifically. The abstract constraint graph is a DAG, but mapping it to a
+physical hardware topology is a subgraph isomorphism problem, which is
+NP-complete in general. The polynomial claim holds only if the hardware topology
+has special structure (e.g., tree topology) — which must be proven, not assumed.
+
+**Critical: composition breaks the class hierarchy.** Two independent Class C
+contracts (individually acyclic) can compose into a Class D problem if they
+share a projection vertex. An adversary can submit many small Class C contracts,
+each individually valid, whose composition creates an NP-complete constraint
+system. The per-contract class restriction does not bound the complexity of the
+*global* constraint system. This is the most serious structural weakness in
+the current design and requires a compositional type theory or a global
+composition checker with bounded complexity.
 
 ### 3.3 Topological Mapper
 
@@ -304,7 +370,214 @@ demolished once the fabric can support itself.
 
 ---
 
-## 4. Adversarial Analysis — The Six Redlines
+## 4. Contract Language — Formal Stress Test
+
+*This section records findings from a rigorous peer-review-style stress test
+of the contract language. It is the most important section for anyone
+considering publication. Findings are classified as Critical (blocks
+publication), Important (significant revision required), or Advisory.*
+
+### 4.1 Pathological Contracts
+
+**Case 1 — The Zero-Latency Paradox**
+
+```rust
+contract! { coherent(cpu_view, gpu_view) within 0ns; }
+```
+
+Syntactically valid (Class B). Physically impossible: minimum CXL round-trip
+latency is ~100–500ns. The contract verifier must have lower-bound latency
+data per hardware link to reject this at load time. Without it, the contract
+is accepted and the system enters permanent oscillation. This reveals a
+fundamental gap: the verifier needs both upper-bound feasibility (can the
+hardware achieve `within T`?) and lower-bound feasibility (is `T` physically
+achievable at all?). The architecture description only addresses the former.
+
+**Case 2 — The Cross-Application Cycle**
+
+Application A declares `coherent(A_cpu, A_gpu) within 50ns` and
+`relaxed(A_gpu, shared_nic)`. Application B independently declares
+`coherent(B_gpu, shared_nic) within 30ns` and `coherent(shared_nic, A_cpu)
+within 20ns`. The composition creates a coherency cycle with a mixed
+coherent/relaxed edge. Each contract is individually valid. The composition
+is globally inconsistent — but there is no described mechanism for
+cross-application contract composition checking. The kernel silently operates
+with an inconsistent global constraint.
+
+**Case 3 — The Timing Interference Chain**
+
+Three applications each submit a valid Class B contract routing through
+overlapping CXL fabric links. Under light load all three are satisfied. Under
+heavy load, shared link contention causes all three to miss their bounds
+simultaneously. The contract language has no vocabulary for expressing or
+tracking bandwidth consumption on shared fabric elements — two contracts can
+be individually satisfiable but mutually incompatible under contention.
+
+**Case 4 — The Phantom Exclusivity Alias**
+
+```rust
+// Application A
+let t1 = CapabilityTensor::new(region_0x1000_0000_to_0x1FFF_FFFF);
+contract! { exclusive(t1.project::<CpuAddressSpace>()); }
+
+// Application B (different tensor object, overlapping physical backing)
+let t2 = CapabilityTensor::new(region_0x1000_to_0x2000_subregion);
+contract! { exclusive(t2.project::<GpuAddressSpace>()); }
+```
+
+Both contracts are accepted. Both applications believe they have exclusive
+access. Neither does. The Rust borrow checker cannot detect physical address
+overlap between independently constructed tensor objects. Physical aliasing
+detection at the kernel level is a hard requirement, not an optimisation.
+
+**Case 5 — The Transitivity Horizon**
+
+```rust
+contract! {
+    coherent(A, B) within 50ns;
+    coherent(B, C) within 50ns;
+    // Is coherent(A, C) within 100ns guaranteed? The language doesn't say.
+}
+```
+
+If the application assumes transitivity (reasonable) but the kernel doesn't
+enforce it (underspecified), the application has a latent correctness bug that
+manifests only when `A → C` propagation takes the slow path. This is an
+underspecification, not an edge case.
+
+### 4.2 The Composition Problem (Critical)
+
+The class hierarchy does not bound the complexity of composed contracts.
+Formally: let `G₁` be the constraint graph of contract `C₁` (Class C, acyclic)
+and `G₂` be the constraint graph of `C₂` (Class C, acyclic). If `G₁` and `G₂`
+share a vertex (a projection referenced by both), then `G₁ ∪ G₂` may contain
+a cycle, making the composed problem Class D (NP-complete).
+
+The DoS prevention mechanism (restricting users to Class C) fails at the
+system level. An adversary submitting many individually valid Class C contracts
+can compose them into a Class D constraint system, paying only Class C credit
+per submission. The economic rate limiting doesn't bound composition cost.
+
+**Required fix (one of):**
+1. A global composition checker that verifies the composed constraint graph
+   remains in the target class — but this checker may itself be NP-hard
+2. A prohibition on shared projections across contracts — eliminates most
+   interesting multi-application scenarios
+3. A compositional type theory where `C₁ ⊕ C₂` is a defined operation with
+   a provable complexity bound
+
+### 4.3 The Global Clock Problem (Critical)
+
+`within 100ns` is not physically meaningful as a hard guarantee in a
+distributed hardware system. There is no global clock. Each compute element
+has its own local clock with drift that varies with temperature. CXL provides
+ordering (A's write is ordered before B's read) but not timing. Clock skew
+between devices is on the order of 1–10ns.
+
+**The minimal counterexample:**
+
+```rust
+contract! { coherent(cpu_view, gpu_view) within 1ns; }
+```
+
+This is a valid Class B contract syntactically. It is physically impossible:
+propagation delay alone across a 30cm PCIe/CXL trace is ~1ns; store buffer
+drain, cache writeback, CXL request, and GPU cache fill each take additional
+nanoseconds. The contract verifier, without lower-bound latency data, accepts
+it. The hardware never satisfies it. The kernel oscillates.
+
+**Required fix:** Ground `within T` in hardware-observable happens-before
+ordering events, with `T` treated as an engineering target verified against
+observed hardware latency distributions, not as a hard guarantee. This weakens
+the guarantee claim but makes it honest.
+
+### 4.4 Failure Attribution (Important)
+
+In a multi-party coherency contract, violations are non-attributable by design.
+Consider a three-device coherency ring where `cpu → nic` visibility takes 120ns
+against a 50ns contract. The violation could be caused by GPU forwarding delay,
+NIC local buffering, CXL fabric retry, or CPU store buffer drain. The witness
+chain confirms that the write eventually arrived — it does not identify which
+component caused the delay.
+
+The re-mapping response is therefore blind: it tries a different topological
+mapping without knowing which component to route around. This is a fundamental
+limitation, not an implementation gap. Attributable violations require a
+component with a global view — which the tensorial model eliminated.
+
+**Implication for recovery:** The failure degradation mechanism (re-mapping,
+contract relaxation) is heuristic, not targeted. The paper must acknowledge
+this explicitly rather than implying that re-mapping resolves the underlying
+fault.
+
+### 4.5 Load-Time vs. Runtime Verification Gap (Critical)
+
+The architecture claims contracts are verified at load time against the hardware
+topology. But:
+
+- Lower-bound latency feasibility (`within 1ns` is impossible) requires
+  knowing achievable hardware latency — which is runtime data
+- Composition conflicts with other active contracts require knowledge of all
+  currently active contracts — which changes at runtime
+- Physical aliasing detection requires knowing all currently allocated tensor
+  physical ranges — which changes at runtime
+
+Load-time verification can check structural feasibility (is this contract
+syntactically well-formed and graph-class-compatible?). It cannot check
+physical feasibility or composition safety without runtime information. The
+paper must clearly separate what is verified at load time from what is
+monitored at runtime, and what guarantees hold in each case.
+
+### 4.6 Comparison to Existing Formal Models
+
+| Formalism | What it captures | Gap vs. tensorial contracts |
+|---|---|---|
+| Memory consistency models (TSO, ARM) | Ordering and visibility | No timing bounds; assume shared address space |
+| δ-consistency (Yu & Vahdat 2000) | Bounded-time visibility | Assumes global clock; no type-level ownership |
+| Session types | Typed communication protocols | Handles protocols, not shared memory consistency |
+| Linear logic / linear types | Resource ownership, single use | Atemporal; no visibility or ordering semantics |
+| Fractional permissions (Boyland 2003) | Read/write capability splitting | No timing; no cross-device semantics |
+
+**The genuine novelty:** The tensorial contract language is the first proposal
+to combine fractional-permissions-style ownership (for projections) with
+bounded-visibility consistency guarantees (for coherency) expressed as a
+kernel-facing API grounded in the host language's type system. Each piece
+exists separately. The combination does not.
+
+**The recommended formalisation path:** Ground the contract language in
+fractional permissions (Boyland 2003) for the ownership semantics, and
+happens-before ordering from the CXL formal memory model for the consistency
+semantics. Treat timing bounds as advisory engineering targets (for
+optimisation and degradation decisions) rather than hard correctness
+guarantees. This is a meaningful weakening of the original claim but produces
+a model that is honest and potentially verifiable.
+
+### 4.7 Publication Readiness Assessment
+
+| Finding | Severity | Status |
+|---|---|---|
+| `within T` undefined without global clock | **Critical** | Open |
+| Composition breaks class hierarchy | **Critical** | Open |
+| Physical aliasing not detected by type system | **Critical** | Open |
+| Load-time vs. runtime verification conflated | **Critical** | Open |
+| Class C polynomial claim unproven for hardware mapping | **Important** | Open |
+| Failure attribution is non-deterministic | **Important** | Open |
+| Coherency transitivity undefined | **Important** | Open |
+| `relaxed` convergence undefined | **Important** | Open |
+| `exclusive` granularity unspecified | Advisory | Open |
+| Fractional permissions connection unmade | Advisory | Open |
+
+**Verdict:** The contract language is promising but seriously underspecified
+for publication at SOSP or EuroSys. It is suitable for a HotOS position paper
+if the four Critical items are addressed and the remaining items are explicitly
+acknowledged as open problems. The closest path to publication is grounding the
+formal semantics in fractional permissions + CXL happens-before, restricting
+timing bounds to advisory status, and adding a global composition checker (or
+proving composition is restricted).
+
+---
+
+## 5. Adversarial Analysis — The Six Redlines
 
 ### Redline 1: The Byzantine Interconnect
 
@@ -397,7 +670,7 @@ requiring maintenance of two kernel paths.
 
 ---
 
-## 5. Current State of Research
+## 6. Current State of Research
 
 ### The Research Landscape in 2026
 
@@ -475,7 +748,7 @@ The research literature explicitly identifies these as unsolved:
 
 ---
 
-## 6. Novelty Assessment
+## 7. Novelty Assessment
 
 ### What Exists (Prior Art)
 
@@ -486,6 +759,8 @@ The research literature explicitly identifies these as unsolved:
 | CXL as coherency fabric | Active 2024–25 research | Hardware just arriving |
 | Linear types as resource primitive | RaBAB-NeuSym, CapsLock (2025) | Independent convergence |
 | Distributed kernel consistency | Barrelfish (2009) | Conceptual precedent |
+| Read/write capability splitting | Fractional permissions, Boyland (2003) | Direct formal precedent for projection model |
+| Bounded-time visibility (δ-consistency) | Yu & Vahdat (2000) | Direct semantic precedent for `coherent within T` |
 
 ### What Appears Novel
 
@@ -498,14 +773,21 @@ The research literature explicitly identifies these as unsolved:
 | **Epoch tombstoning for fabric teardown** | Not found in literature |
 | **Stratified bootstrap with self-revoking authority** | Not found in literature |
 | **Contract class hierarchy for DoS prevention** | Not found in literature |
+| **Rust ownership as cross-device coherency enforcement mechanism** | Not found in literature — strongest novel claim |
 
 ### The Honest Novelty Claim
 
 The tensorial kernel is **a novel synthesis in an active field**, not a novel
-invention in isolation. Every individual component has precedent. What hasn't
-been proposed is the unifying abstraction: consistency contracts as the primary
-interface, resources as multi-perspective typed projections, and a topological
-mapper that replaces the scheduler. That synthesis appears to be original.
+invention in isolation. The ownership semantics have a formal predecessor in
+fractional permissions (Boyland 2003). The timing semantics have a predecessor
+in δ-consistency (Yu & Vahdat 2000). What hasn't been proposed is the unifying
+abstraction: applying these two formalisms together, grounded in Rust's type
+system, as a kernel-facing API over heterogeneous CXL-connected hardware.
+
+Critically, applying Rust's `Send`/`Sync` traits as **coherency markers** —
+where `!Send` means "cannot cross a coherency domain boundary without a
+contract" — is specific, implementable, and not previously proposed. This is
+the strongest individual novel claim in the architecture.
 
 The field has independently validated the core premises across 2024–25 papers,
 which means the research community is converging on the problem space without
@@ -513,7 +795,7 @@ having proposed this specific solution.
 
 ---
 
-## 7. Practical Applications
+## 8. Practical Applications
 
 ### 7.1 AI/ML Training Infrastructure (Strongest Case)
 
@@ -612,7 +894,7 @@ deployment at scale: 2028–2030.
 
 ---
 
-## 8. Honest Evaluation — Pros and Cons
+## 9. Honest Evaluation — Pros and Cons
 
 ### Genuine Advantages
 
@@ -647,6 +929,17 @@ synthetic violations and verify degradation paths. This is nearly impossible
 with current kernels whose invariants are implicit.
 
 ### Real Limitations
+
+**The contract language has critical open problems.**
+As detailed in Section 4, the contract language as currently described has
+four critical underspecifications that block publication: the global clock
+problem (`within T` is not well-defined in distributed hardware), the
+composition problem (Class C contracts compose into Class D), physical aliasing
+(the type system cannot detect overlapping tensor physical addresses), and the
+load-time vs. runtime verification conflation. These are not minor gaps —
+they affect the correctness of the core guarantee claim. The architecture's
+value proposition ("contracts are verified at load time, rejecting infeasible
+contracts") is currently overstated.
 
 **The contract language is the entire bet.**
 The history of formal specification languages suggests that languages
@@ -695,7 +988,7 @@ decades.
 
 ---
 
-## 9. Hardware Prerequisites and Timeline
+## 10. Hardware Prerequisites and Timeline
 
 ### What the Architecture Requires
 
@@ -731,32 +1024,45 @@ The hardware is arriving faster than the software. As of 2026:
 
 ---
 
-## 10. Recommended Next Steps
+## 11. Recommended Next Steps
 
 ### Most Valuable Near-Term Contribution
 
 A full production tensorial kernel is not the right first step. The most
 valuable near-term contribution, in order of priority:
 
-**1. Formalise the contract language**
-Define the syntax and semantics of consistency contracts precisely. Prove the
-class hierarchy (A through D) has the claimed complexity bounds. This is a
-publishable theoretical contribution independent of any implementation.
+**1. Resolve the four critical contract language gaps (prerequisite for everything else)**
+- Ground `within T` in hardware-observable happens-before ordering from the
+  CXL formal memory model, not wall-clock time. Treat timing as advisory.
+- Define `C₁ ⊕ C₂` composition explicitly and prove the class of the result,
+  or restrict composition with a justified argument.
+- Implement physical aliasing detection at the kernel level — two tensors over
+  overlapping physical ranges must be detected at contract submission time.
+- Clearly separate load-time structural verification from runtime physical
+  feasibility monitoring, with defined guarantees for each.
 
-**2. Write a position paper**
-Target HotOS or EuroSys. Frame relative to Stramash and M3 as: "what should
+**2. Ground the formal semantics in existing theory**
+Ground ownership semantics in fractional permissions (Boyland 2003) and
+visibility semantics in δ-consistency (Yu & Vahdat 2000) combined with CXL
+happens-before ordering. This provides an existing formal foundation rather
+than requiring a new one from scratch.
+
+**3. Write a position paper**
+Target HotOS (short, position-paper bar) rather than SOSP/EuroSys until the
+critical items are resolved. Frame relative to Stramash and M3: "what should
 the OS interface look like once the hardware these systems assume becomes
-widespread?" The novelty claim is the contract language and projection model —
-not the hardware assumptions.
+widespread?" The novelty claim is the Rust-ownership-as-coherency-enforcement
+mapping and the consistency contract API — be precise about what is novel and
+what is synthesis.
 
-**3. Implement a tensorial subsystem within Linux**
+**4. Implement a tensorial subsystem within Linux**
 Rather than a new kernel, implement the topological mapper and contract
 verifier as a Linux kernel module for CXL-aware NUMA memory. This gives a
-real implementation surface, real hardware to test on, and a path to actual
-adoption. The IOMMU management and epoch-based teardown are implementable
-today on CXL 2.0 hardware.
+real implementation surface, real hardware to test on, and a path to adoption.
+The IOMMU management and epoch-based teardown are implementable today on CXL
+2.0 hardware.
 
-**4. Build the HFT proof of concept**
+**5. Build the HFT proof of concept**
 The highest-confidence near-term application. Implement consistency contracts
 for network-to-compute data paths using existing RDMA infrastructure — no CXL
 required. This validates the contract language design against a workload where
@@ -764,21 +1070,26 @@ performance is precisely measurable and the economics justify the effort.
 
 ### Academic Venue Targets
 
-- **HotOS** — position papers, early ideas, "what if" architecture proposals
-- **EuroSys** — systems research with implementation evidence
-- **OSDI / SOSP** — full research papers with strong evaluation
-- **ASPLOS** — architecture/OS intersection, hardware-software co-design
+- **HotOS** — position papers, early ideas; appropriate venue once Critical
+  items are addressed
+- **EuroSys** — systems research with implementation evidence; target after
+  Linux subsystem prototype exists
+- **OSDI / SOSP** — full research papers with strong evaluation; target after
+  HFT or genomics proof of concept
+- **ASPLOS** — architecture/OS intersection, hardware-software co-design;
+  good fit for CXL-native work
 
 ### Collaboration Targets
 
-- TU Dresden (M3 team) — heterogeneous OS design
-- CXL Consortium — hardware specification input
+- TU Dresden (M3 team) — heterogeneous OS design, directly related prior work
+- CXL Consortium — hardware specification input, formal memory model access
 - NVIDIA Research — GPU/NPU participation model
+- Boyland / fractional permissions community — formal semantics grounding
 - Any group working on CXL software stacks — the gap is acknowledged and open
 
 ---
 
-## 11. References and Related Work
+## 12. References and Related Work
 
 ### Core Architecture References
 
@@ -797,6 +1108,26 @@ performance is precisely measurable and the economics justify the effort.
 
 - **XSched:** OSDI 2025. Heterogeneous XPU scheduling with unified abstraction.
   Complementary approach to same problem.
+
+### Formal Theory References
+
+- **Fractional Permissions:** Boyland, J., "Checking Interference with Fractional
+  Permissions," SAS 2003. The formal grounding for the `CapabilityTensor`
+  projection model. Read-capable fractions + write-capable whole maps directly
+  onto `coherent` vs. `exclusive`. Recommended foundation for contract language
+  semantics.
+
+- **δ-Consistency:** Yu, H. & Vahdat, A., "Design and Evaluation of a Continuous
+  Consistency Model for Replicated Services," OSDI 2000. Bounded-time visibility
+  semantics — the formal predecessor to `coherent(A, B) within T`. Critically,
+  this model also assumes a global clock, which is the same gap the tensorial
+  contract language must address.
+
+- **Lamport Clocks / Happens-Before:** Lamport, L., "Time, Clocks, and the
+  Ordering of Events in a Distributed System," CACM 1978. The correct primitive
+  for defining ordering in a distributed hardware system without a global clock.
+  The `within T` guarantee should be redefined in terms of happens-before events
+  observable by the hardware.
 
 ### Formal Verification References
 
@@ -843,28 +1174,70 @@ performance is precisely measurable and the economics justify the effort.
 
 ## Appendix: Key Open Research Questions
 
-1. **Can the contract language be formalised with a tractable type theory?**
-   Session types and linear logic are candidates. The key question is whether
-   Class C (DAG) contracts can be given a sound and complete type system.
+### Contract Language (Critical — prerequisite for publication)
 
-2. **What is the minimum attestation infrastructure required?**
+1. **How should `within T` be formally defined without a global clock?**
+   The most promising approach: define `within T` in terms of
+   hardware-observable happens-before events from the CXL formal memory model,
+   with `T` as an engineering SLO verified against observed latency
+   distributions rather than as a hard correctness guarantee. What is lost by
+   this weakening, and is it acceptable?
+
+2. **Is there a composition operator `C₁ ⊕ C₂` with a bounded complexity class?**
+   Two Class C contracts can compose into a Class D problem. Either a global
+   composition checker with polynomial-time complexity must be designed, or
+   composition must be restricted. What is the most expressive restriction
+   that preserves polynomial-time composition?
+
+3. **How is physical aliasing detected at the kernel level?**
+   Two independently constructed `CapabilityTensor` objects over overlapping
+   physical ranges must be detected at contract submission time. What data
+   structure should the kernel maintain? What is the complexity of overlap
+   detection as a function of active contract count?
+
+4. **Can the contract language be grounded in fractional permissions?**
+   Boyland's fractional permissions (SAS 2003) provide a sound and complete
+   type theory for read/write capability splitting. Can `coherent` and
+   `exclusive` be defined as surface syntax over a fractional permission model
+   extended with δ-consistency? What extensions are required?
+
+5. **Is coherency transitivity implied or not, and at what cost?**
+   If `coherent(A,B) within 50ns` and `coherent(B,C) within 50ns`, is
+   `coherent(A,C) within 100ns` guaranteed? If yes, pairwise constraints grow
+   O(n²). If no, applications will assume it and have latent bugs. The semantics
+   must commit to one answer with formal justification.
+
+### Architecture (Important)
+
+6. **What is the minimum attestation infrastructure required?**
    CXL 3.0 adds integrity and data encryption. Is this sufficient for Stratum 2
    ratification, or does the witness chain require dedicated silicon?
 
-3. **Can the Bayesian fabric model converge fast enough?**
+7. **Can the Bayesian fabric model converge fast enough?**
    The jitter classification requires sufficient history to distinguish noise
-   from failure. How much history? What are the false positive/negative rates?
+   from failure. How much history is required? What are the false positive and
+   false negative rates for the autocorrelation-based classifier?
 
-4. **How does the topological mapper handle dynamic topology changes?**
+8. **How does the topological mapper handle dynamic topology changes?**
    Hotplug of CXL devices, device failure, thermal-induced bandwidth reduction.
    The mapper must renegotiate contracts without disrupting executing workloads.
+   What is the renegotiation protocol and its latency?
 
-5. **What is the performance cost of epoch-based teardown?**
+9. **What is the performance cost of epoch-based teardown?**
    The drain window adds latency to preemption. Is this acceptable for the
-   workloads where the tensorial kernel provides the most benefit?
+   workloads where the tensorial kernel provides the most benefit? What is the
+   minimum achievable drain window on CXL 3.x hardware?
 
-6. **Is there a path to formal verification?**
-   seL4 required 20 person-years of proof effort for 8,700 lines of C. The
-   tensorial kernel's distributed consistency model is significantly more complex.
-   What subset of properties could be verified first, and what proof techniques
-   are appropriate?
+10. **Is failure attribution recoverable in the multi-party case?**
+    Violations in a multi-party coherency ring are non-attributable without a
+    global observer. Is there a partial attribution mechanism that narrows the
+    suspect set sufficiently to guide targeted re-mapping?
+
+### Verification (Long-term)
+
+11. **Is there a path to formal verification?**
+    seL4 required 20 person-years of proof effort for 8,700 lines of C. The
+    tensorial kernel's distributed consistency model is significantly more
+    complex. What subset of properties could be verified first (e.g., epoch
+    teardown safety, physical aliasing freedom), and what proof techniques are
+    appropriate (separation logic, TLA+, Iris)?
